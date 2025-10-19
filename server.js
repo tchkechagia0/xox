@@ -1,195 +1,215 @@
-// server.js
+// server.js  (Multi-room, 2 kişilik odalar, lobby, refresh korumalı)
 const express = require("express");
 const app = express();
 const http = require("http").createServer(app);
 const { Server } = require("socket.io");
-const io = new Server(http, { cors: { origin: "*" } });
 
+// Render / Railway vb. için PORT'u kullan
+const PORT = process.env.PORT || 3000;
+
+const io = new Server(http, { cors: { origin: "*" } });
 app.use(express.static("public"));
 
-/**
- * Tek oda (demo): room-1
- * Refresh koruması için client her bağlantıda "token" gönderir (localStorage).
- * Aynı token = aynı slot (X/O). 3. ve sonrası bekler (lobi).
- */
+// ====== ODA YAPISI ======
+// Her oda: X, O, board, turn, inGame, rematchVotes (Set), lastActive
+const rooms = {};                // { "room-1": {...}, ... }
+const MAX_ROOMS = 5;             // Ücretsiz planda ~5 paralel oyun güvenli
+const ROOM_CAPACITY = 2;         // 2 kişilik (X vs O)
 
-const ROOM_ID = "room-1";
-const room = {
-    X: null, // { token, sid }
-    O: null, // { token, sid }
-    board: Array(9).fill(null),
-    turn: "X",
-    inGame: false,
-    rematchVotes: new Set(), // winner/draw sonrası iki oyuncunun da onayı
-};
+// Token -> roomId eşlemesi (refresh'te aynı odaya dönsün)
+const tokenToRoom = new Map();
 
-function getOccupancy() {
-    return (room.X ? 1 : 0) + (room.O ? 1 : 0);
-}
-
-function boardFull(b) {
-    return b.every((v) => v !== null);
-}
-
-function winnerOf(b) {
-    const L = [
-        [0,1,2],[3,4,5],[6,7,8], // satırlar
-        [0,3,6],[1,4,7],[2,5,8], // sütunlar
-        [0,4,8],[2,4,6]          // çapraz
-    ];
-    for (const [a,c,d] of L) {
-        if (b[a] && b[a] === b[c] && b[a] === b[d]) return b[a];
-    }
+// Yardımcılar
+const now = () => Date.now();
+const blankBoard = () => Array(9).fill(null);
+const winOf = (b) => {
+    const L = [[0,1,2],[3,4,5],[6,7,8],[0,3,6],[1,4,7],[2,5,8],[0,4,8],[2,4,6]];
+    for (const [a,c,d] of L) if (b[a] && b[a]===b[c] && b[a]===b[d]) return b[a];
     return null;
+};
+const full = (b) => b.every(v=>v!==null);
+
+// Oda oluştur
+function createRoom(id){
+    rooms[id] = {
+        id,
+        X: null,                 // { token, sid }
+        O: null,                 // { token, sid }
+        board: blankBoard(),
+        turn: "X",
+        inGame: false,
+        rematchVotes: new Set(),
+        lastActive: now()
+    };
+    return rooms[id];
 }
 
-function emitState() {
-    io.to(ROOM_ID).emit("updateBoard", { gameBoard: room.board, currentTurn: room.turn });
+// Uygun odayı bul/oluştur
+function findOrCreateRoomForToken(token){
+    // Token daha önce bir odaya girmişse oraya döndür
+    const prior = tokenToRoom.get(token);
+    if (prior && rooms[prior]) return rooms[prior];
+
+    // Boş/eksik oyunculu bir oda bul
+    for (const r of Object.values(rooms)){
+        const occ = (r.X?1:0) + (r.O?1:0);
+        if (occ < ROOM_CAPACITY) return r;
+    }
+    // Gerekirse yeni oda aç (limit içinde)
+    const existing = Object.keys(rooms).length;
+    if (existing < MAX_ROOMS){
+        const id = `room-${existing+1}`;
+        return createRoom(id);
+    }
+    return null; // Lobby'de bekleteceğiz
 }
 
-function emitRoles(socket) {
-    if (room.X && socket.data.token === room.X.token) socket.emit("playerRole", "X");
-    else if (room.O && socket.data.token === room.O.token) socket.emit("playerRole", "O");
-    else socket.emit("playerRole", null);
-}
-
-function startGameIfReady() {
-    if (room.X && room.O) {
+function startGame(room){
+    if (room.X && room.O){
         room.inGame = true;
-        room.board = Array(9).fill(null);
+        room.board = blankBoard();
         room.turn = "X";
         room.rematchVotes.clear();
-        io.to(ROOM_ID).emit("startGame");
-        emitState();
-        io.to(ROOM_ID).emit("status", "Oyun başladı. X başlıyor.");
+        io.to(room.id).emit("startGame", { roomId: room.id });
+        io.to(room.id).emit("status", `Oda: ${room.id} – Oyun başladı. X başlıyor.`);
+        emitState(room);
     }
 }
 
-io.on("connection", (socket) => {
-    // refresh koruması: token ile kimlik
+function emitState(room){
+    io.to(room.id).emit("updateBoard", { gameBoard: room.board, currentTurn: room.turn });
+    room.lastActive = now();
+}
+
+io.on("connection", (socket)=>{
     const token = socket.handshake.auth?.token || null;
     socket.data.token = token;
 
+    // Oda belirle
+    let room = findOrCreateRoomForToken(token);
+
+    if (!room){
+        // Tüm odalar dolu → lobby bekleme
+        socket.emit("waiting", "Tüm odalar dolu. Lütfen bekleyiniz…");
+        socket.emit("status", "Lobi: Uygun oda bekleniyor.");
+        return;
+    }
+
     // Odaya kat
-    socket.join(ROOM_ID);
+    socket.join(room.id);
+    socket.data.roomId = room.id;
+    tokenToRoom.set(token, room.id);
+    socket.emit("joinedRoom", { roomId: room.id });
 
-    // Slot tahsisi (token eşleşirse yerine oturt; yeni ise boş yere yerleştir)
-    const takenByToken =
-        (room.X && room.X.token === token) ? "X" :
-            (room.O && room.O.token === token) ? "O" : null;
-
-    if (!takenByToken) {
-        // yeni biri: uygun slot var mı?
-        if (!room.X) {
-            room.X = { token, sid: socket.id };
-        } else if (!room.O) {
-            room.O = { token, sid: socket.id };
-        } else {
-            // dolu → lobiye bilgi ver
-            socket.emit("waiting", "Oyun dolu. Lütfen bekleyin…");
-        }
+    // Slot ataması (refresh ise SID güncelle)
+    if (room.X && room.X.token === token){
+        room.X.sid = socket.id;
+        socket.emit("playerRole", "X");
+    } else if (room.O && room.O.token === token){
+        room.O.sid = socket.id;
+        socket.emit("playerRole", "O");
+    } else if (!room.X){
+        room.X = { token, sid: socket.id };
+        socket.emit("playerRole", "X");
+    } else if (!room.O){
+        room.O = { token, sid: socket.id };
+        socket.emit("playerRole", "O");
     } else {
-        // refresh: SID güncelle
-        if (takenByToken === "X") room.X.sid = socket.id;
-        if (takenByToken === "O") room.O.sid = socket.id;
+        // Oda doluysa; başka oda deneyelim (tekrar çağır)
+        // (Nadir: aynı anda iki kişi dolduysa)
+        socket.leave(room.id);
+        const alt = findOrCreateRoomForToken(token);
+        if (!alt){ // Tamamen dolu
+            socket.emit("waiting", "Tüm odalar dolu. Lütfen bekleyiniz…");
+            socket.emit("status", "Lobi: Uygun oda bekleniyor.");
+            return;
+        }
+        room = alt;
+        socket.join(room.id);
+        socket.data.roomId = room.id;
+        tokenToRoom.set(token, room.id);
+        socket.emit("joinedRoom", { roomId: room.id });
+        if (!room.X){ room.X = { token, sid: socket.id }; socket.emit("playerRole","X"); }
+        else if (!room.O){ room.O = { token, sid: socket.id }; socket.emit("playerRole","O"); }
     }
 
-    emitRoles(socket);
-
-    // Oda durumu bildir
-    const occ = getOccupancy();
-    if (occ === 1) {
-        socket.emit("status", "Bir yolcu daha bekleniyor…");
-    } else if (occ >= 2) {
-        // iki oyuncu varsa oyunu başlat/hatırlat
-        startGameIfReady();
-    }
-
-    // Lobiye sürekli durum iletisi
-    if (occ >= 2 && !(takenByToken || !room.X || !room.O)) {
-        socket.emit("waiting", "Oyun devam ediyor. Lütfen bitmesini bekleyin…");
-        socket.emit("status", "Lobi: Oyun sürüyor.");
+    // Oda durumu
+    const occ = (room.X?1:0)+(room.O?1:0);
+    if (occ === 1){
+        socket.emit("status", `Oda: ${room.id} – Bir yolcu daha bekleniyor…`);
+    } else if (occ === 2){
+        startGame(room);
     }
 
     // Hamle
-    socket.on("play", (index) => {
-        // sadece X/O hamle atabilir
+    socket.on("play", (index)=>{
+        const rid = socket.data.roomId; if (!rid) return;
+        const r = rooms[rid]; if (!r || !r.inGame) return;
+
         const role =
-            room.X && room.X.token === socket.data.token ? "X" :
-                room.O && room.O.token === socket.data.token ? "O" : null;
-
-        if (!role) return; // lobi
-        if (!room.inGame) return;
-        if (role !== room.turn) return;
-        if (room.board[index] !== null) return;
-
-        room.board[index] = role;
-        room.turn = room.turn === "X" ? "O" : "X";
-
-        const w = winnerOf(room.board);
-        if (w) {
-            io.to(ROOM_ID).emit("updateBoard", { gameBoard: room.board, currentTurn: room.turn });
-            io.to(ROOM_ID).emit("gameOver", { result: "win", winner: w });
-            io.to(ROOM_ID).emit("status", `Oyun bitti. Kazanan: ${w}`);
-            room.inGame = false;
-            room.rematchVotes.clear();
-            return;
-        }
-        if (boardFull(room.board)) {
-            io.to(ROOM_ID).emit("updateBoard", { gameBoard: room.board, currentTurn: room.turn });
-            io.to(ROOM_ID).emit("gameOver", { result: "draw" });
-            io.to(ROOM_ID).emit("status", "Oyun bitti. Beraberlik.");
-            room.inGame = false;
-            room.rematchVotes.clear();
-            return;
-        }
-
-        emitState();
-    });
-
-    // Rematch (aynı ikili)
-    socket.on("rematch", () => {
-        const role =
-            room.X && room.X.token === socket.data.token ? "X" :
-                room.O && room.O.token === socket.data.token ? "O" : null;
+            (r.X && r.X.token===socket.data.token) ? "X" :
+                (r.O && r.O.token===socket.data.token) ? "O" : null;
         if (!role) return;
-        room.rematchVotes.add(role);
-        io.to(ROOM_ID).emit("rematchUpdate", { votes: Array.from(room.rematchVotes) });
+        if (role !== r.turn) return;
+        if (r.board[index] !== null) return;
 
-        if (room.rematchVotes.has("X") && room.rematchVotes.has("O")) {
-            // iki oyuncu da onayladı
-            room.board = Array(9).fill(null);
-            room.turn = "X";
-            room.inGame = true;
-            room.rematchVotes.clear();
-            io.to(ROOM_ID).emit("rematchStart");
-            emitState();
-            io.to(ROOM_ID).emit("status", "Yeni oyun başladı. X başlıyor.");
+        r.board[index] = role;
+        r.turn = (r.turn==="X") ? "O" : "X";
+
+        const w = winOf(r.board);
+        if (w){
+            emitState(r);
+            io.to(r.id).emit("gameOver", { result:"win", winner:w });
+            io.to(r.id).emit("status", `Oda: ${r.id} – Oyun bitti. Kazanan: ${w}`);
+            r.inGame = false; r.rematchVotes.clear();
+            return;
+        }
+        if (full(r.board)){
+            emitState(r);
+            io.to(r.id).emit("gameOver", { result:"draw" });
+            io.to(r.id).emit("status", `Oda: ${r.id} – Oyun bitti. Beraberlik.`);
+            r.inGame = false; r.rematchVotes.clear();
+            return;
+        }
+        emitState(r);
+    });
+
+    // Rematch
+    socket.on("rematch", ()=>{
+        const rid = socket.data.roomId; if (!rid) return;
+        const r = rooms[rid]; if (!r) return;
+        const role =
+            (r.X && r.X.token===socket.data.token) ? "X" :
+                (r.O && r.O.token===socket.data.token) ? "O" : null;
+        if (!role) return;
+
+        r.rematchVotes.add(role);
+        io.to(r.id).emit("rematchUpdate", { votes: Array.from(r.rematchVotes) });
+        if (r.rematchVotes.has("X") && r.rematchVotes.has("O")){
+            r.board = blankBoard();
+            r.turn = "X";
+            r.inGame = true;
+            r.rematchVotes.clear();
+            io.to(r.id).emit("rematchStart");
+            emitState(r);
+            io.to(r.id).emit("status", `Oda: ${r.id} – Yeni oyun başladı. X başlıyor.`);
         }
     });
 
-    socket.on("disconnect", () => {
-        // Sekme kapanırsa slot’u hemen boşaltma; demo stabilitesi için boşaltıyoruz,
-        // ama token kalacağı için geri girince aynı role atanacak (auth.token aynıysa).
-        if (room.X && room.X.sid === socket.id) {
-            room.X.sid = null; // token duruyor
-            io.to(ROOM_ID).emit("status", "X bağlantısı koptu. Yeniden bağlanabilir.");
-        } else if (room.O && room.O.sid === socket.id) {
-            room.O.sid = null;
-            io.to(ROOM_ID).emit("status", "O bağlantısı koptu. Yeniden bağlanabilir.");
-        }
+    // Disconnect (slot'ta token kalsın; yeniden bağlanabilir)
+    socket.on("disconnect", ()=>{
+        const rid = socket.data.roomId; if (!rid) return;
+        const r = rooms[rid]; if (!r) return;
 
-        // Her iki slot da tamamen boşaldıysa sıfırla (temizlik)
-        if ((room.X && !room.X.sid) && (room.O && !room.O.sid)) {
-            room.inGame = false;
-            room.board = Array(9).fill(null);
-            room.turn = "X";
-            room.rematchVotes.clear();
-            io.to(ROOM_ID).emit("status", "Oyun sıfırlandı. Yeni oyuncular bekleniyor.");
-        }
+        if (r.X && r.X.sid === socket.id){ r.X.sid = null; io.to(r.id).emit("status", `Oda: ${r.id} – X bağlantısı koptu.`); }
+        if (r.O && r.O.sid === socket.id){ r.O.sid = null; io.to(r.id).emit("status", `Oda: ${r.id} – O bağlantısı koptu.`); }
+
+        // Oda tamamen boşaldıysa belirli süre sonra temizlenebilir (opsiyonel)
+        // Burada sadece lastActive güncelliyoruz.
+        r.lastActive = now();
     });
 });
 
-http.listen(3000, () => {
-    console.log("Metro-XOX sunucusu: http://localhost:3000");
+http.listen(PORT, () => {
+    console.log(`Metro-XOX (multi-room) listening on http://localhost:${PORT}`);
 });
