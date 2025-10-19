@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <title>Metro XOX</title>
+    <style>
+        body {
+            background: #0b0e12;
+            color: #e8f1f2;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            display: flex; align-items: center; justify-content: center;
+            height: 100vh; margin: 0; padding: 0 16px;
+        }
+        .panel {
+            width: 100%; max-width: 420px; text-align: center;
+            background: linear-gradient(180deg,#0f141b,#0b0e12);
+            border: 1px solid #1f2a36; border-radius: 16px; padding: 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.45), inset 0 0 20px rgba(0,255,160,0.04);
+        }
+        h1 { margin: 0 0 8px; font-weight: 700; letter-spacing: 0.3px; }
+        .sub { opacity: 0.8; margin-bottom: 16px; font-size: 14px; }
+
+        #status { font-size: 14px; opacity: 0.9; margin-bottom: 10px; }
+        #message {
+            margin: 10px 0 12px; min-height: 22px;
+            color: #00ffa0; font-weight: 600;
+            text-shadow: 0 0 8px rgba(0,255,160,0.25);
+        }
+
+        .board {
+            display: grid; grid-template-columns: repeat(3, 110px); gap: 8px;
+            margin: 16px auto 10px;
+        }
+        .cell {
+            width: 110px; height: 110px;
+            background: #0f1620; border: 2px solid #253243; border-radius: 12px;
+            font-size: 56px; line-height: 110px; color: #00ff88;
+            display: flex; align-items: center; justify-content: center;
+            cursor: pointer; user-select: none;
+            transition: transform 0.1s ease, background 0.2s ease, border-color 0.2s ease;
+            box-shadow: inset 0 0 0 rgba(0,0,0,0);
+        }
+        .cell:hover { background: #122033; border-color: #2f445d; transform: translateY(-1px); }
+        #role { margin-top: 4px; opacity: 0.9; }
+
+        .line {
+            height: 1px; background: linear-gradient(90deg, transparent,#1f2a36, transparent);
+            margin: 12px 0;
+        }
+        .btn {
+            appearance: none; border: 1px solid #1f2a36; background: #0f1620; color: #e8f1f2;
+            padding: 10px 14px; border-radius: 10px; cursor: pointer; font-weight: 600;
+            transition: background 0.2s ease, border-color 0.2s ease, transform 0.05s ease;
+        }
+        .btn:hover { background: #122033; border-color: #2b3a4d; }
+        .btn:active { transform: translateY(1px); }
+        #rematchBtn { display: none; margin-top: 6px; }
+    </style>
+</head>
+<body>
+<!-- Bekleme -->
+<div id="waiting" class="panel">
+    <h1>🚇 Metro XOX</h1>
+    <div class="sub">QR’ı tarayan yolcuları eşliyoruz…</div>
+    <div id="status"></div>
+    <div class="line"></div>
+    <div class="sub">Oyun doluysa bu ekranda kalır, bitince otomatik geçersiniz.</div>
+</div>
+
+<!-- Oyun -->
+<div id="game" class="panel" style="display:none">
+    <h1>🚇 Metro XOX</h1>
+    <div id="status"></div>
+    <div id="message"></div>
+    <div class="board" id="board"></div>
+    <div id="role"></div>
+    <button id="rematchBtn" class="btn">Yeniden Oyna</button>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
